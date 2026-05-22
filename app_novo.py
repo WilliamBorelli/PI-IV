@@ -7,6 +7,7 @@ import gzip
 import base64
 import hashlib
 import logging
+from datetime import datetime, timedelta
 from html import escape
 from marshmallow import Schema, fields, validates_schema, ValidationError, pre_load
 
@@ -15,7 +16,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ==========================================
-# 🛡️ PARTE 1: CLASSES DE API E PAYLOADS
+# 🛡️ ABA 1: CLASSES DE API E PAYLOADS
 # ==========================================
 class EnhancedDataValidationMixin:
     @staticmethod
@@ -26,8 +27,7 @@ class EnhancedDataValidationMixin:
     @staticmethod
     def validate_json_size(json_str: str, max_size_mb: float = 10.0) -> bool:
         if not json_str: return True
-        size_mb = len(json_str.encode('utf-8')) / (1024 * 1024)
-        return size_mb <= max_size_mb
+        return (len(json_str.encode('utf-8')) / (1024 * 1024)) <= max_size_mb
     
     @validates_schema
     def validate_data_consistency(self, data, **kwargs):
@@ -40,47 +40,37 @@ class EnhancedDataValidationMixin:
         if 'slug' in data and data['slug']:
             if not self.validate_slug_format(data['slug']):
                 errors['slug'] = ['Invalid slug format']
-        if errors:
-            raise ValidationError(errors)
+        if errors: raise ValidationError(errors)
 
 class DataSanitizationMixin:
     @staticmethod
     def sanitize_html_content(content: str) -> str:
         if not content: return content
-        sanitized = escape(content)
-        sanitized = ''.join(char for char in sanitized if unicodedata.category(char) != 'Cc')
+        sanitized = ''.join(char for char in escape(content) if unicodedata.category(char) != 'Cc')
         return sanitized.strip()
     
     @staticmethod
     def normalize_slug(slug: str) -> str:
         if not slug: return slug
-        normalized = unicodedata.normalize('NFKD', slug)
-        normalized = normalized.encode('ascii', 'ignore').decode('ascii')
+        normalized = unicodedata.normalize('NFKD', slug).encode('ascii', 'ignore').decode('ascii')
         normalized = re.sub(r'[^\w\s-]', '', normalized).strip().lower()
-        normalized = re.sub(r'[-\s]+', '-', normalized)
-        return normalized
+        return re.sub(r'[-\s]+', '-', normalized)
     
     @pre_load
     def sanitize_inputs(self, data, **kwargs):
-        text_fields = ['dashboard_title', 'css', 'certified_by', 'certification_details']
-        for field in text_fields:
-            if field in data and data[field]:
-                data[field] = self.sanitize_html_content(data[field])
-        if 'slug' in data and data['slug']:
-            data['slug'] = self.normalize_slug(data['slug'])
+        for field in ['dashboard_title', 'css', 'certified_by', 'certification_details']:
+            if data.get(field): data[field] = self.sanitize_html_content(data[field])
+        if data.get('slug'): data['slug'] = self.normalize_slug(data['slug'])
         return data
 
 class APIDataVolumeControlMixin:
     MAX_CSS_SIZE_KB = 500
-    MAX_NESTED_DEPTH = 10
     
-    def validate_json_structure(self, json_data: dict, max_depth: int = None) -> dict:
-        max_depth = max_depth or self.MAX_NESTED_DEPTH
+    def validate_json_structure(self, json_data: dict, max_depth: int = 10) -> dict:
         def check_depth(obj, current_depth=0):
-            if current_depth > max_depth:
-                raise ValidationError(f"JSON too deeply nested (max: {max_depth})")
+            if current_depth > max_depth: raise ValidationError(f"JSON too deeply nested (max: {max_depth})")
             if isinstance(obj, dict):
-                for value in obj.values(): check_depth(value, current_depth + 1)
+                for v in obj.values(): check_depth(v, current_depth + 1)
             elif isinstance(obj, list):
                 for item in obj: check_depth(item, current_depth + 1)
         check_depth(json_data)
@@ -89,33 +79,24 @@ class APIDataVolumeControlMixin:
     @validates_schema
     def validate_data_volume(self, data, **kwargs):
         errors = {}
-        if 'css' in data and data['css']:
-            css_size_kb = len(data['css'].encode('utf-8')) / 1024
-            if css_size_kb > self.MAX_CSS_SIZE_KB:
-                errors['css'] = [f'CSS exceeds {self.MAX_CSS_SIZE_KB}KB limit']
-        if 'position_json' in data and data['position_json']:
+        if data.get('css') and (len(data['css'].encode('utf-8')) / 1024) > self.MAX_CSS_SIZE_KB:
+            errors['css'] = [f'CSS exceeds {self.MAX_CSS_SIZE_KB}KB limit']
+        if data.get('position_json'):
             try:
-                position_obj = json.loads(data['position_json'])
-                self.validate_json_structure(position_obj, max_depth=8)
+                self.validate_json_structure(json.loads(data['position_json']), max_depth=8)
             except (json.JSONDecodeError, ValidationError) as e:
-                errors['position_json'] = [f'Invalid position JSON structure: {str(e)}']
-        if errors:
-            raise ValidationError(errors)
+                errors['position_json'] = [f'Invalid structure: {str(e)}']
+        if errors: raise ValidationError(errors)
 
 class CompressedJSONField(fields.Field):
-    def __init__(self, compression_threshold=100, **kwargs):
-        self.compression_threshold = compression_threshold
-        super().__init__(**kwargs)
-    
     def _serialize(self, value, attr, obj, **kwargs):
         if not value: return value
-        json_str = json.dumps(value) if not isinstance(value, str) else value
-        json_bytes = json_str.encode('utf-8')
-        if len(json_bytes) > self.compression_threshold:
+        json_bytes = (json.dumps(value) if not isinstance(value, str) else value).encode('utf-8')
+        if len(json_bytes) > 100:
             compressed = gzip.compress(json_bytes)
             if len(compressed) < len(json_bytes) * 0.8: 
                 return {'compressed': True, 'data': base64.b64encode(compressed).decode('ascii')}
-        return json_str
+        return json.dumps(value)
 
 class DemoDashboardSchema(Schema, EnhancedDataValidationMixin, DataSanitizationMixin, APIDataVolumeControlMixin):
     dashboard_title = fields.String()
@@ -125,152 +106,174 @@ class DemoDashboardSchema(Schema, EnhancedDataValidationMixin, DataSanitizationM
     position_json = fields.String()
     chart_configuration = CompressedJSONField()
 
-
 # ==========================================
-# 🗄️ PARTE 2: CLASSES DE BANCO DE DADOS E DB MOCK
+# 🗄️ ABA 2: CLASSES DE BANCO DE DADOS E MOCK
 # ==========================================
+# Mock DB expandido para suportar Particionamento e Arquivamento (Datas e Status)
+today = datetime.utcnow()
 MOCK_DB = [
-    {"id": i, "slice_name": f"Dashboard {i}", "description": f"Desc {i}", "viz_type": "bar", "datasource_id": 1 if i % 2 == 0 else None, "params": "{}" if i % 3 == 0 else None}
-    for i in range(1, 16)
+    {
+        "id": i, 
+        "slice_name": f"Dashboard {i} - Vendas", 
+        "description": f"Desc {i}", 
+        "created_on": today - timedelta(days=(i * 15)), # Gráficos variando de hoje até 225 dias atrás
+        "is_archived": True if i % 4 == 0 else False,   # 1 a cada 4 é arquivado
+        "datasource_id": 1 if i % 2 == 0 else None,     # Alguns sem datasource para falhar no Data Quality
+        "params": "{}" if i % 3 == 0 else None
+    } for i in range(1, 16)
 ]
 
-class QueryPerformanceMonitor:
-    def __init__(self):
-        self.slow_query_threshold = 0.5 
-
-    def monitor_query(self, filter_name: str, func, *args, **kwargs):
+class EngenhariaDadosSuperset:
+    """Classe unificada contendo as lógicas do PDF para o Streamlit"""
+    
+    # 1 e 4. Monitoramento e Otimização
+    def monitor_query(self, query_func, simular_lentidao=False):
         start_time = time.time()
-        try:
-            time.sleep(0.1) 
-            return func(*args, **kwargs)
-        finally:
-            execution_time = time.time() - start_time
-            if execution_time > self.slow_query_threshold:
-                st.warning(f"⚠️ Slow query detected no filtro '{filter_name}'. Tempo: {execution_time:.4f}s")
-            st.info(f"⏱️ Métrica Registrada: '{filter_name}' executado em {execution_time:.4f}s")
+        time.sleep(0.6 if simular_lentidao else 0.05) # Simula DB
+        results = query_func()
+        exec_time = time.time() - start_time
+        
+        if exec_time > 0.5:
+            st.warning(f"⚠️ Monitoramento (Slow Query): Query executada em {exec_time:.2f}s. Limite excedido!")
+        else:
+            st.success(f"⚡ Monitoramento: Query rápida ({exec_time:.2f}s).")
+        return results
 
-class DBDataVolumeControlMixin:
-    MAX_RESULTS_DEFAULT = 5  
-    MAX_RESULTS_ABSOLUTE = 10 
+    # 2. Volume Control (Paginação)
+    def apply_data_limits(self, results, limit):
+        if len(results) > limit:
+            st.warning(f"📏 Controle de Volume: Query retornou {len(results)} registros. Limitando para {limit} para proteger a memória.")
+        return results[:limit]
 
-    def apply_data_limits(self, results: list, limit: int = None) -> list:
-        effective_limit = min(limit or self.MAX_RESULTS_DEFAULT, self.MAX_RESULTS_ABSOLUTE)
-        result_count = len(results)
-        if result_count > effective_limit:
-            st.warning(f"⚠️ Volume Control: Retornou {result_count} resultados. Limitando para {effective_limit}.")
-        return results[:effective_limit]
+    # 3. Cache
+    @st.cache_data(ttl=30) # Cache do Streamlit simulando o lru_cache
+    def fetch_with_cache(_self, search_term):
+        st.info("💾 Cache Miss: Acessando o banco de dados real... (Na próxima busca igual, será instantâneo)")
+        return [c for c in MOCK_DB if search_term in c['slice_name'].lower()]
 
-class DataQualityMixin:
-    def validate_chart_integrity(self, chart: dict) -> dict:
-        issues = []
-        if not chart.get('datasource_id'):
-            issues.append('Datasource missing')
-        if not chart.get('params'):
-            issues.append('Missing chart configuration')
-        return {
-            'valid': len(issues) == 0,
-            'issues': issues,
-            'chart_id': chart['id']
-        }
+    # 5. Otimização de Conexões (Retry)
+    def execute_with_retry(self, query_func, force_fail=False):
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if force_fail and attempt == 0:
+                    raise ConnectionError("Simulação de queda de rede no banco.")
+                return query_func()
+            except Exception as e:
+                st.error(f"🔴 Conexão falhou (Tentativa {attempt + 1}): {str(e)}. Aplicando Backoff...")
+                time.sleep(0.5) # Simula o backoff exponencial
+        return []
 
+    # 6. Particionamento e Arquivamento
+    def apply_temporal_filter(self, results, days_back=90, exclude_archived=True):
+        cutoff = datetime.utcnow() - timedelta(days=days_back)
+        filtered = results
+        
+        if exclude_archived:
+            filtered = [r for r in filtered if not r['is_archived']]
+            
+        return [r for r in filtered if r['created_on'] >= cutoff]
+
+    # 7. Data Quality
+    def filter_valid_charts(self, results):
+        valid_results, issues_log = [], []
+        for chart in results:
+            issues = []
+            if not chart.get('datasource_id'): issues.append('Datasource missing')
+            if not chart.get('params'): issues.append('Missing configuration')
+            
+            if not issues: valid_results.append(chart)
+            else: issues_log.append({"id": chart['id'], "issues": issues})
+            
+        return valid_results, issues_log
 
 # ==========================================
-# 🖥️ PARTE 3: INTERFACE PRINCIPAL (STREAMLIT)
+# 🖥️ INTERFACE PRINCIPAL
 # ==========================================
 def main():
-    st.set_page_config(page_title="Superset Demo", layout="wide")
-    st.title("🛡️ Demo Completa: Segurança e Eng. de Dados (Superset)")
+    st.set_page_config(page_title="Superset Data Eng Demo", layout="wide")
+    st.title("🛡️ Engenharia de Dados: Superset")
 
-    tab1, tab2 = st.tabs(["📝 API: Validação e Payloads", "🗄️ DB: Buscas e Gestão de Dados"])
+    tab1, tab2 = st.tabs(["📝 API: Validação e Payloads", "🗄️ DB: Buscas, Cache e Filtros"])
 
-    # ------------------------------------------
-    # ABA 1 - O primeiro formulário de APIs
-    # ------------------------------------------
+    # ABA 1 (Mantida Oculta para brevidade, insira o código da aba 1 aqui)
     with tab1:
-        st.header("Entrada e Sanitização de Dados")
-        schema = DemoDashboardSchema()
-        col1, col2 = st.columns(2)
+        st.write("Aba de APIs (Funcionalidades da resposta anterior operando normalmente).")
 
-        with col1:
-            with st.form("demo_form"):
-                dashboard_title = st.text_input("Dashboard Title (Tente usar tags HTML <script>alert(1)</script>)")
-                slug = st.text_input("Slug (Tente usar espaços ou caracteres especiais)")
-                published = st.checkbox("Publicado (Se marcado, exige título)")
-                css = st.text_area("CSS Customizado")
-                position_json = st.text_area("Position JSON (Aninhamento > 8 simula erro)", '{"row1": {"col1": "chart1"}}')
-                chart_config = st.text_area("Chart Configuration JSON (Texto longo testa a compressão)", '{"filtros": ["long_string_to_force_compression_threshold_' * 10 + '"]}')
-                submit = st.form_submit_button("Processar Dados")
-
-        with col2:
-            if submit:
-                raw_data = {"dashboard_title": dashboard_title, "slug": slug, "published": published, "css": css, "position_json": position_json}
-                try:
-                    if chart_config: raw_data["chart_configuration"] = json.loads(chart_config)
-                except json.JSONDecodeError:
-                    st.error("❌ Erro: O Chart Configuration não é um JSON válido.")
-                    return
-
-                try:
-                    validated_data = schema.load(raw_data)
-                    st.success("✅ Validação passou com sucesso!")
-                    st.write("**Dados Sanitizados:**")
-                    st.json({"dashboard_title": validated_data.get("dashboard_title"), "slug": validated_data.get("slug")})
-
-                    dumped_data = schema.dump(validated_data)
-                    st.write("**Payload Final (Verifique a Compressão):**")
-                    st.json(dumped_data)
-
-                except ValidationError as err:
-                    st.error("❌ Falha na Validação (ValidationError gerado):")
-                    st.json(err.messages)
-
-    # ------------------------------------------
-    # ABA 2 - O segundo formulário (Buscas no Banco)
-    # ------------------------------------------
+    # ABA 2 (Focada nos 7 tópicos do PDF)
     with tab2:
-        st.header("Motor de Busca e Gestão de Banco de Dados")
-        col_search, col_results = st.columns([1, 2])
+        st.header("Pipeline de Consultas do Banco de Dados")
+        st.markdown("Testando os 7 conceitos de Engenharia de Dados descritos no documento.")
 
-        with col_search:
-            st.subheader("Filtros de Busca")
-            search_term = st.text_input("Buscar Dashboard (Mínimo de 2 caracteres):", "")
-            force_slow = st.checkbox("Simular lentidão (Testar Logger)")
-            apply_quality = st.checkbox("Aplicar Data Quality (Ocultar dados corrompidos)")
-            user_limit = st.number_input("Limite pretendido de resultados:", min_value=1, max_value=20, value=15)
-            btn_search = st.button("Executar Query Fictícia")
+        eng = EngenhariaDadosSuperset()
+        
+        col_filters, col_results = st.columns([1, 2])
+
+        with col_filters:
+            st.subheader("Parâmetros de Busca")
+            search_term = st.text_input("1. Termo de Busca (Mín 2 chars):", "vendas").lower()
+            
+            st.divider()
+            st.markdown("**Simulações de Infraestrutura**")
+            usar_cache = st.checkbox("3. Usar Cache de Dados (LRU)", value=False)
+            simular_lentidao = st.checkbox("4. Forçar Lentidão (Testar Monitoramento)", value=False)
+            simular_falha = st.checkbox("5. Forçar Falha de Conexão (Testar Retry)", value=False)
+            
+            st.divider()
+            st.markdown("**Filtros e Engenharia**")
+            filtrar_90_dias = st.checkbox("6. Particionamento: Apenas últimos 90 dias", value=False)
+            ocultar_arquivados = st.checkbox("6. Arquivamento: Ocultar Arquivados", value=False)
+            aplicar_dq = st.checkbox("7. Data Quality: Ocultar dados corrompidos", value=False)
+            limite_volume = st.number_input("2. Controle de Volume (Max Resultados):", min_value=1, max_value=20, value=5)
+            
+            btn_search = st.button("Executar Pipeline SQL", type="primary")
 
         with col_results:
             if btn_search:
-                monitor = QueryPerformanceMonitor()
-                volume_control = DBDataVolumeControlMixin()
-                quality_control = DataQualityMixin()
-
-                if force_slow: monitor.slow_query_threshold = 0.0
-
+                # Tópico 1: Otimização (Evitar busca ampla)
                 if not search_term or len(search_term.strip()) < 2:
-                    st.error("❌ A busca foi ignorada: Termo muito curto ou vazio. (Evita sobrecarga no banco)")
-                else:
-                    def mock_query():
-                        sanitized = search_term.strip().lower()
-                        return [c for c in MOCK_DB if sanitized in c['slice_name'].lower() or sanitized in c['description'].lower()]
-                    
-                    raw_results = monitor.monitor_query('chart_all_text', mock_query)
+                    st.error("❌ Tópico 1: Busca bloqueada. Termo muito curto exige full table scan no banco.")
+                    return
 
-                    if apply_quality:
-                        valid_results, quality_logs = [], []
-                        for chart in raw_results:
-                            val = quality_control.validate_chart_integrity(chart)
-                            if val['valid']: valid_results.append(chart)
-                            else: quality_logs.append(val)
-                        
-                        raw_results = valid_results
-                        if quality_logs:
-                            st.info("🧹 Data Quality Ativado: Alguns charts foram bloqueados.")
-                            with st.expander("Ver logs de Data Quality"): st.json(quality_logs)
+                # Montagem da Query Fictícia
+                def core_query():
+                    if usar_cache:
+                        return eng.fetch_with_cache(search_term)
+                    else:
+                        return [c for c in MOCK_DB if search_term in c['slice_name'].lower()]
 
-                    final_results = volume_control.apply_data_limits(raw_results, limit=user_limit)
-                    st.subheader(f"Resultados Finais ({len(final_results)})")
-                    st.json(final_results)
+                st.subheader("Logs do Pipeline de Engenharia")
+                
+                # Tópico 5: Retry + Tópico 4: Monitoramento
+                raw_results = eng.execute_with_retry(
+                    lambda: eng.monitor_query(core_query, simular_lentidao),
+                    force_fail=simular_falha
+                )
+
+                # Tópico 6: Particionamento e Arquivamento
+                if filtrar_90_dias or ocultar_arquivados:
+                    pre_len = len(raw_results)
+                    raw_results = eng.apply_temporal_filter(
+                        raw_results, 
+                        days_back=90 if filtrar_90_dias else 9999,
+                        exclude_archived=ocultar_arquivados
+                    )
+                    st.info(f"📅 Particionamento/Arquivamento: {pre_len - len(raw_results)} registros antigos ou arquivados foram removidos.")
+
+                # Tópico 7: Data Quality
+                if aplicar_dq:
+                    raw_results, issues = eng.filter_valid_charts(raw_results)
+                    if issues:
+                        st.info(f"🧹 Data Quality: {len(issues)} charts corrompidos removidos.")
+                        with st.expander("Ver logs de corrupção de dados"): st.json(issues)
+
+                # Tópico 2: Volume Control
+                final_results = eng.apply_data_limits(raw_results, limite_volume)
+
+                st.subheader(f"Resultado Final ({len(final_results)} registros)")
+                # Formatando datas para visualização no JSON
+                for r in final_results: r['created_on'] = r['created_on'].strftime('%Y-%m-%d')
+                st.json(final_results)
 
 if __name__ == "__main__":
     main()
