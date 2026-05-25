@@ -10,67 +10,92 @@ from datetime import datetime, timedelta
 from html import escape
 from marshmallow import Schema, fields, validates_schema, ValidationError, pre_load
 
-# Configuração de log para monitoramento
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ==========================================
+# 🤖 NOVA CAMADA: ANÁLISE POR IA (LLM)
+# ==========================================
+class AIPayloadAnalyzer:
+    """
+    Simula a integração com uma LLM (Gemini, OpenAI, Claude) 
+    para analisar payloads e explicar falhas de segurança/validação.
+    """
+    def analyze_api_error(self, raw_payload: dict, error_messages: dict) -> str:
+        """Envia o payload e o erro para a IA explicar."""
+        # Na vida real, aqui entraria o código: 
+        # response = openai.ChatCompletion.create(prompt=f"Explique este erro: {error_messages} no payload {raw_payload}")
+        
+        time.sleep(1.5) # Simula o delay da rede da LLM
+        
+        # Gerando respostas dinâmicas baseadas no tipo de erro simulado
+        analise = "**Análise da IA de Segurança:**\n\n"
+        
+        if "position_json" in error_messages:
+            analise += "🕵️‍♂️ **Detecção de Anomalia:** Notei que o campo `position_json` contém um nível de aninhamento extremamente profundo. Isso é uma assinatura clássica de um ataque **Billion Laughs** ou **JSON DoS** (Denial of Service), onde o atacante tenta esgotar a memória do nosso parser.\n\n"
+            analise += "* **Recomendação:** Mantenha o bloqueio do `APIDataVolumeControlMixin` e considere bloquear temporariamente o IP de origem."
+            
+        elif "dashboard_title" in error_messages:
+            analise += "📝 **Regra de Negócio Violada:** O usuário tentou publicar um dashboard sem título. \n\n"
+            analise += "* **Impacto UX:** Dashboards sem título quebram a renderização do catálogo frontal.\n"
+            if "<script>" in str(raw_payload.get("dashboard_title", "")):
+                analise += "⚠️ **ALERTA CRÍTICO:** Além disso, o título original continha tags HTML perigosas indicando uma tentativa de **Cross-Site Scripting (XSS)**. A camada de sanitização agiu corretamente antes do bloqueio."
+        
+        elif "slug" in error_messages:
+            analise += "🔗 **Formatação de Rota:** O slug fornecido não segue o padrão URL-friendly esperado (apenas letras minúsculas, números e hifens).\n"
+            analise += "* **Correção sugerida:** O frontend deve forçar a validação usando o Regex `^[a-z0-9]+(?:-[a-z0-9]+)*$` antes de enviar o payload."
+        else:
+            analise += "🔍 Analisei os erros reportados e eles estão consistentes com as regras de integridade de dados."
+
+        return analise
+
+    def analyze_data_quality(self, issues: list) -> str:
+        """Analisa os problemas de corrupção do banco de dados."""
+        time.sleep(1.5)
+        total = len(issues)
+        analise = f"**Relatório do Agente de IA (Data Quality):**\n\n"
+        analise += f"Analisei os {total} gráficos corrompidos barrados pelo filtro.\n"
+        analise += "- 📉 A maioria apresenta falha no `datasource_id`, o que sugere que um banco de dados foi deletado, mas os gráficos continuaram órfãos no sistema.\n"
+        analise += "- 🛠️ **Ação Recomendada:** Sugiro rodar um script de limpeza (Garbage Collection) no banco de dados para remover metadados órfãos e melhorar a performance geral das queries."
+        return analise
+
+
+# ==========================================
 # 🛡️ PARTE 1: SEGURANÇA E VALIDAÇÃO DE APIs
 # ==========================================
-
 class EnhancedDataValidationMixin:
-    """
-    Mixin focado em Regras de Negócio e Proteção contra Entradas Maliciosas.
-    Garante que os dados façam sentido antes de chegarem ao banco.
-    """
     @staticmethod
     def validate_slug_format(slug: str) -> bool:
-        # Previne URLs inválidas ou injeção de caracteres de controle em rotas
         pattern = r'^[a-z0-9]+(?:-[a-z0-9]+)*$'
         return re.match(pattern, slug.lower()) is not None
     
     @staticmethod
     def validate_json_size(json_str: str, max_size_mb: float = 10.0) -> bool:
-        # Previne estouro de memória limitando o tamanho físico do payload em MB
         if not json_str: return True
         return (len(json_str.encode('utf-8')) / (1024 * 1024)) <= max_size_mb
     
     @validates_schema
     def validate_data_consistency(self, data, **kwargs):
-        """Validação cruzada: verifica dependências entre campos diferentes"""
         errors = {}
-        
-        # Regra de Negócio: Um dashboard não pode ser publicado sem título
         if data.get('published') and not data.get('dashboard_title'):
             errors['dashboard_title'] = ['Published dashboards must have a title']
-            
-        # Proteção de Memória: Valida o tamanho dos campos JSON
         for field in ['json_metadata', 'position_json']:
             if field in data and not self.validate_json_size(data[field]):
                 errors[field] = [f'{field} exceeds maximum size limit']
-                
-        # Consistência de URL
         if 'slug' in data and data['slug']:
             if not self.validate_slug_format(data['slug']):
                 errors['slug'] = ['Invalid slug format']
-                
         if errors: raise ValidationError(errors)
 
 class DataSanitizationMixin:
-    """
-    Mixin focado em Limpeza de Dados.
-    Roda ANTES da validação (@pre_load) para neutralizar ameaças (ex: XSS).
-    """
     @staticmethod
     def sanitize_html_content(content: str) -> str:
-        # Escapa tags HTML perigosas (ex: <script>) e remove caracteres de controle invisíveis
         if not content: return content
         sanitized = ''.join(char for char in escape(content) if unicodedata.category(char) != 'Cc')
         return sanitized.strip()
     
     @staticmethod
     def normalize_slug(slug: str) -> str:
-        # Remove acentos, transforma espaços em hifens e força letras minúsculas
         if not slug: return slug
         normalized = unicodedata.normalize('NFKD', slug).encode('ascii', 'ignore').decode('ascii')
         normalized = re.sub(r'[^\w\s-]', '', normalized).strip().lower()
@@ -78,7 +103,6 @@ class DataSanitizationMixin:
     
     @pre_load
     def sanitize_inputs(self, data, **kwargs):
-        """Aplica a limpeza automaticamente em todos os campos de texto"""
         for field in ['dashboard_title', 'css', 'certified_by', 'certification_details']:
             if field in data and data[field]: 
                 data[field] = self.sanitize_html_content(data[field])
@@ -87,16 +111,9 @@ class DataSanitizationMixin:
         return data
 
 class APIDataVolumeControlMixin:
-    """
-    Mixin focado em Prevenção de Ataques de Negação de Serviço (DoS).
-    """
     MAX_CSS_SIZE_KB = 500
     
     def validate_json_structure(self, json_data: dict, max_depth: int = 10) -> dict:
-        """
-        Analisa a profundidade do JSON. JSONs infinitamente aninhados 
-        podem travar o parser do servidor (Billion Laughs / JSON DoS).
-        """
         def check_depth(obj, current_depth=0):
             if current_depth > max_depth: raise ValidationError(f"JSON too deeply nested (max: {max_depth})")
             if isinstance(obj, dict):
@@ -109,11 +126,8 @@ class APIDataVolumeControlMixin:
     @validates_schema
     def validate_data_volume(self, data, **kwargs):
         errors = {}
-        # Limita o tamanho do CSS malicioso
         if data.get('css') and (len(data['css'].encode('utf-8')) / 1024) > self.MAX_CSS_SIZE_KB:
             errors['css'] = [f'CSS exceeds {self.MAX_CSS_SIZE_KB}KB limit']
-            
-        # Valida a estrutura profunda do JSON de posições
         if data.get('position_json'):
             try:
                 self.validate_json_structure(json.loads(data['position_json']), max_depth=8)
@@ -122,22 +136,15 @@ class APIDataVolumeControlMixin:
         if errors: raise ValidationError(errors)
 
 class CompressedJSONField(fields.Field):
-    """
-    Otimização de Rede: Comprime payloads grandes antes de salvar/enviar,
-    reduzindo custos de transferência e latência.
-    """
     def _serialize(self, value, attr, obj, **kwargs):
         if not value: return value
         json_bytes = (json.dumps(value) if not isinstance(value, str) else value).encode('utf-8')
-        
-        # Só comprime se valer a pena (tamanho > 100 bytes e redução > 20%)
         if len(json_bytes) > 100:
             compressed = gzip.compress(json_bytes)
             if len(compressed) < len(json_bytes) * 0.8: 
                 return {'compressed': True, 'data': base64.b64encode(compressed).decode('ascii')}
         return json.dumps(value)
 
-# Schema final aglomerando todas as proteções
 class DemoDashboardSchema(Schema, EnhancedDataValidationMixin, DataSanitizationMixin, APIDataVolumeControlMixin):
     dashboard_title = fields.String()
     slug = fields.String()
@@ -150,8 +157,6 @@ class DemoDashboardSchema(Schema, EnhancedDataValidationMixin, DataSanitizationM
 # ==========================================
 # 🗄️ PARTE 2: ENGENHARIA E PERFORMANCE DE DB
 # ==========================================
-
-# Banco de Dados Simulado (Mock) com dados propositalmente sujos/antigos
 today = datetime.utcnow()
 MOCK_DB = [
     {
@@ -166,11 +171,7 @@ MOCK_DB = [
 ]
 
 class EngenhariaDadosSuperset:
-    """Implementação dos 7 tópicos de performance do PDF"""
-    
-    # Tópico 4: Monitoramento e Métricas
     def monitor_query(self, query_func, simular_lentidao=False):
-        """Mede o tempo da query e gera alertas de observabilidade se exceder o limite (0.5s)"""
         start_time = time.time()
         time.sleep(0.6 if simular_lentidao else 0.05) 
         results = query_func()
@@ -182,23 +183,17 @@ class EngenhariaDadosSuperset:
             st.success(f"⚡ Monitoramento: Query rápida ({exec_time:.2f}s).")
         return results
 
-    # Tópico 2: Paginação e Volume Control
     def apply_data_limits(self, results, limit):
-        """Aplica um hard-limit nos resultados para evitar Out-Of-Memory no servidor"""
         if len(results) > limit:
             st.warning(f"📏 Controle de Volume: Query retornou {len(results)} registros. Limitando para {limit} para proteger a memória.")
         return results[:limit]
 
-    # Tópico 3: Cache Inteligente
     @st.cache_data(ttl=30)
     def fetch_with_cache(_self, search_term):
-        """Simula um lru_cache. Impede que o banco de dados processe buscas repetidas."""
         st.info("💾 Cache Miss: Acessando o banco de dados real... (Na próxima busca igual, será instantâneo)")
         return [c for c in MOCK_DB if search_term in c['slice_name'].lower()]
 
-    # Tópico 5: Conexões de Banco
     def execute_with_retry(self, query_func, force_fail=False):
-        """Garante resiliência (Backoff Exponencial) caso o banco sofra microquedas."""
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -210,18 +205,14 @@ class EngenhariaDadosSuperset:
                 time.sleep(0.5)
         return []
 
-    # Tópico 6: Particionamento e Arquivamento
     def apply_temporal_filter(self, results, days_back=90, exclude_archived=True):
-        """Acelera queries limitando a busca apenas a partições de datas recentes/ativas."""
         cutoff = datetime.utcnow() - timedelta(days=days_back)
         filtered = results
         if exclude_archived:
             filtered = [r for r in filtered if not r['is_archived']]
         return [r for r in filtered if r['created_on'] >= cutoff]
 
-    # Tópico 7: Data Quality
     def filter_valid_charts(self, results):
-        """Garante a integridade: impede que a interface quebre ao tentar renderizar charts corrompidos."""
         valid_results, issues_log = [], []
         for chart in results:
             issues = []
@@ -237,7 +228,10 @@ class EngenhariaDadosSuperset:
 # ==========================================
 def main():
     st.set_page_config(page_title="Superset Complete Demo", layout="wide")
-    st.title("🛡️ Engenharia de Dados & Segurança: Apache Superset")
+    st.title("🛡️ Engenharia de Dados, Segurança e IA: Apache Superset")
+    
+    # Instanciando o nosso agente de IA
+    ai_agent = AIPayloadAnalyzer()
 
     tab1, tab2 = st.tabs(["📝 API: Validação e Payloads", "🗄️ DB: Buscas, Cache e Filtros"])
 
@@ -257,6 +251,11 @@ def main():
                 css = st.text_area("CSS Customizado")
                 position_json = st.text_area("Position JSON (Aninhamento > 8 simula erro)", '{"row1": {"col1": "chart1"}}')
                 chart_config = st.text_area("Chart Configuration JSON (Texto longo testa a compressão)", '{"filtros": ["long_string_to_force_compression_threshold_' * 10 + '"]}')
+                
+                # Nova flag de IA
+                st.divider()
+                usar_ia_api = st.checkbox("🤖 Ativar Análise de IA para Erros de Payload", value=True)
+                
                 submit = st.form_submit_button("Processar Dados")
 
         with col2:
@@ -271,23 +270,28 @@ def main():
                 try:
                     validated_data = schema.load(raw_data)
                     st.success("✅ Validação passou com sucesso!")
-                    st.write("**Dados Sanitizados (Prontos para o Banco):**")
+                    st.write("**Dados Sanitizados:**")
                     st.json({"dashboard_title": validated_data.get("dashboard_title"), "slug": validated_data.get("slug")})
 
                     dumped_data = schema.dump(validated_data)
-                    st.write("**Payload Final (Verifique a Otimização de Rede/Compressão):**")
+                    st.write("**Payload Final (Compressão):**")
                     st.json(dumped_data)
 
                 except ValidationError as err:
-                    st.error("❌ Falha na Validação (Bloqueado pela API):")
+                    st.error("❌ Falha na Validação (Bloqueado pelas Regras):")
                     st.json(err.messages)
+                    
+                    # INTEGRAÇÃO DA IA AQUI
+                    if usar_ia_api:
+                        with st.spinner("🧠 IA analisando o incidente de segurança..."):
+                            analise = ai_agent.analyze_api_error(raw_data, err.messages)
+                        st.info(analise)
 
     # ------------------------------------------
     # ABA 2: FRONTEND DO BANCO DE DADOS
     # ------------------------------------------
     with tab2:
         st.header("Motor de Busca e Gestão de Banco de Dados")
-        st.markdown("Testando os 7 conceitos de Engenharia de Dados descritos no documento.")
 
         eng = EngenhariaDadosSuperset()
         col_filters, col_results = st.columns([1, 2])
@@ -309,11 +313,14 @@ def main():
             aplicar_dq = st.checkbox("7. Data Quality: Ocultar dados corrompidos", value=False)
             limite_volume = st.number_input("2. Controle de Volume (Max Resultados):", min_value=1, max_value=20, value=5)
             
+            # Nova flag de IA
+            st.divider()
+            usar_ia_db = st.checkbox("🤖 Ativar IA para Insights de Data Quality", value=True)
+            
             btn_search = st.button("Executar Pipeline SQL", type="primary")
 
         with col_results:
             if btn_search:
-                # Tópico 1: Índices e Otimização - Evita Full Table Scan bloqueando buscas amplas
                 if not search_term or len(search_term.strip()) < 2:
                     st.error("❌ Tópico 1: Busca bloqueada. Termo muito curto exige full table scan no banco.")
                     return
@@ -326,13 +333,11 @@ def main():
 
                 st.subheader("Logs do Pipeline de Engenharia")
                 
-                # Executa a query englobando Retry (5) e Monitoramento (4)
                 raw_results = eng.execute_with_retry(
                     lambda: eng.monitor_query(core_query, simular_lentidao),
                     force_fail=simular_falha
                 )
 
-                # Aplica Particionamento/Arquivamento (6)
                 if filtrar_90_dias or ocultar_arquivados:
                     pre_len = len(raw_results)
                     raw_results = eng.apply_temporal_filter(
@@ -342,19 +347,23 @@ def main():
                     )
                     st.info(f"📅 Particionamento/Arquivamento: {pre_len - len(raw_results)} registros antigos ou arquivados foram removidos.")
 
-                # Aplica Data Quality (7)
                 if aplicar_dq:
                     raw_results, issues = eng.filter_valid_charts(raw_results)
                     if issues:
-                        st.info(f"🧹 Data Quality: {len(issues)} charts corrompidos removidos.")
-                        with st.expander("Ver logs de corrupção de dados"): st.json(issues)
+                        st.info(f"🧹 Data Quality: {len(issues)} charts corrompidos removidos pela regra estrita.")
+                        with st.expander("Ver logs brutos de corrupção de dados"): 
+                            st.json(issues)
+                        
+                        # INTEGRAÇÃO DA IA AQUI
+                        if usar_ia_db:
+                            with st.spinner("🧠 IA gerando insights sobre a saúde do banco de dados..."):
+                                insights = ai_agent.analyze_data_quality(issues)
+                            st.info(insights)
 
-                # Aplica Limites de Volume (2)
                 final_results = eng.apply_data_limits(raw_results, limite_volume)
 
                 st.subheader(f"Resultado Final ({len(final_results)} registros)")
                 
-                # Tratamento visual das datas para o JSON final
                 display_results = []
                 for r in final_results:
                     item = r.copy()
